@@ -4,3 +4,5 @@
 /lightning_logs/
 /logs/
 /results/
+.ipynb_checkpoints
+
