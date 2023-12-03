@@ -5,4 +5,5 @@
 /logs/
 /results/
 .ipynb_checkpoints
+__pycache__
 
