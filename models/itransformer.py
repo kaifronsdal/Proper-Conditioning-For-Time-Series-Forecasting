@@ -5,6 +5,7 @@ Transformer Model
 
 import math
 from typing import Optional, Tuple, Union
+from einops import rearrange
 
 import torch
 import torch.nn as nn
@@ -116,7 +117,7 @@ class _PositionalEncoding(nn.Module):
         return self.dropout(x)
 
 
-class _TransformerModule(PLPastCovariatesModule):
+class _ITransformerModule(PLPastCovariatesModule):
     def __init__(
         self,
         input_size: int,
@@ -125,13 +126,11 @@ class _TransformerModule(PLPastCovariatesModule):
         d_model: int,
         nhead: int,
         num_encoder_layers: int,
-        num_decoder_layers: int,
         dim_feedforward: int,
         dropout: float,
         activation: str,
         norm_type: Union[str, nn.Module, None] = None,
         custom_encoder: Optional[nn.Module] = None,
-        custom_decoder: Optional[nn.Module] = None,
         **kwargs,
     ):
         """PyTorch module implementing a Transformer to be used in `TransformerModel`.
@@ -182,72 +181,15 @@ class _TransformerModule(PLPastCovariatesModule):
 
         super().__init__(**kwargs)
 
-        self.seq_len = configs.seq_len
-        self.label_len = configs.label_len
-        self.pred_len = configs.pred_len
-        self.output_attention = configs.output_attention
-
-        # Decomp
-        kernel_size = configs.moving_avg
-        self.decomp = series_decomp(kernel_size)
-
-        # Embedding
-        self.enc_embedding = DataEmbedding_wo_pos(configs.enc_in, configs.d_model, configs.embed, configs.freq,
-                                                  configs.dropout)
-        # Encoder
-        self.encoder = Encoder(
-            [
-                EncoderLayer(
-                    AutoCorrelationLayer(
-                        AutoCorrelation(False, configs.factor, attention_dropout=configs.dropout,
-                                        output_attention=configs.output_attention),
-                        configs.d_model, configs.n_heads),
-                    configs.d_model,
-                    configs.d_ff,
-                    moving_avg=configs.moving_avg,
-                    dropout=configs.dropout,
-                    activation=configs.activation
-                ) for l in range(configs.e_layers)
-            ],
-            norm_layer=my_Layernorm(configs.d_model)
-        )
-        # Decoder
-        if self.task_name == 'long_term_forecast' or self.task_name == 'short_term_forecast':
-            self.dec_embedding = DataEmbedding_wo_pos(configs.dec_in, configs.d_model, configs.embed, configs.freq,
-                                                      configs.dropout)
-            self.decoder = Decoder(
-                [
-                    DecoderLayer(
-                        AutoCorrelationLayer(
-                            AutoCorrelation(True, configs.factor, attention_dropout=configs.dropout,
-                                            output_attention=False),
-                            configs.d_model, configs.n_heads),
-                        AutoCorrelationLayer(
-                            AutoCorrelation(False, configs.factor, attention_dropout=configs.dropout,
-                                            output_attention=False),
-                            configs.d_model, configs.n_heads),
-                        configs.d_model,
-                        configs.c_out,
-                        configs.d_ff,
-                        moving_avg=configs.moving_avg,
-                        dropout=configs.dropout,
-                        activation=configs.activation,
-                    )
-                    for l in range(configs.d_layers)
-                ],
-                norm_layer=my_Layernorm(configs.d_model),
-                projection=nn.Linear(configs.d_model, configs.c_out, bias=True)
-            )
-
-        self.input_size = input_size # 
+        self.input_size = input_size
         self.target_size = output_size
         self.nr_params = nr_params
         self.target_length = self.output_chunk_length
 
-        self.encoder = nn.Linear(input_size, d_model)
-        self.positional_encoding = _PositionalEncoding(
-            d_model, dropout, self.input_chunk_length
-        )
+        self.encoder = nn.Linear(self.input_chunk_length, d_model)
+        # self.positional_encoding = _PositionalEncoding(
+        #     d_model, dropout, self.input_chunk_length
+        # )
 
         if isinstance(norm_type, str):
             try:
@@ -285,20 +227,8 @@ class _TransformerModule(PLPastCovariatesModule):
                 ffn_cls=ffn_cls,
             )
 
-            custom_decoder = _generate_coder(
-                d_model,
-                dim_feedforward,
-                dropout,
-                nhead,
-                num_decoder_layers,
-                self.layer_norm if self.layer_norm else nn.LayerNorm,
-                coder_cls=nn.TransformerDecoder,
-                layer_cls=CustomFeedForwardDecoderLayer,
-                ffn_cls=ffn_cls,
-            )
-
         # if layer norm set and no GLU variant is used
-        if self.layer_norm and custom_decoder is None:
+        if self.layer_norm and custom_encoder is None:
             custom_encoder = _generate_coder(
                 d_model,
                 dim_feedforward,
@@ -311,75 +241,88 @@ class _TransformerModule(PLPastCovariatesModule):
                 ffn_cls=None,
             )
 
-            custom_decoder = _generate_coder(
-                d_model,
-                dim_feedforward,
-                dropout,
-                nhead,
-                num_decoder_layers,
-                self.layer_norm,
-                coder_cls=nn.TransformerDecoder,
-                layer_cls=nn.TransformerDecoderLayer,
-                ffn_cls=None,
+        # otherwise
+        if custom_encoder is None:
+            encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, 
+                                                        dim_feedforward=dim_feedforward,
+                                                        activation=activation,
+                                                        dropout=dropout
+                                                      )
+            custom_encoder = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=num_encoder_layers,
+                norm=nn.LayerNorm(d_model),
             )
 
-        # Defining the Transformer module
-        self.transformer = nn.Transformer(
-            d_model=d_model,
-            nhead=nhead,
-            num_encoder_layers=num_encoder_layers,
-            num_decoder_layers=num_decoder_layers,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
-            activation=activation,
-            custom_encoder=custom_encoder,
-            custom_decoder=custom_decoder,
-        )
+        self.transformer = custom_encoder
 
         self.decoder = nn.Linear(
             d_model, self.target_length * self.target_size * self.nr_params
         )
 
-    def _create_transformer_inputs(self, data):
-        # '_TimeSeriesSequentialDataset' stores time series in the
-        # (batch_size, input_chunk_length, input_size) format. PyTorch's nn.Transformer
-        # module needs it the (input_chunk_length, batch_size, input_size) format.
-        # Therefore, the first two dimensions need to be swapped.
-        src = data.permute(1, 0, 2)
-        tgt = src[-1:, :, :]
-
-        return src, tgt
+        self.projection = nn.Linear(
+            self.input_size, 1
+        )
 
     @io_processor
     def forward(self, x_in: Tuple):
-        data, _ = x_in
-        # Here we create 'src' and 'tgt', the inputs for the encoder and decoder
-        # side of the Transformer architecture
-        src, tgt = self._create_transformer_inputs(data)
+        src, _ = x_in
 
-        # "math.sqrt(self.input_size)" is a normalization factor
-        # see section 3.2.1 in 'Attention is All you Need' by Vaswani et al. (2017)
+        # means = src.mean(1, keepdim=True).detach()
+        # src = src - means
+        # stdev = torch.sqrt(torch.var(src, dim=1, keepdim=True, unbiased=False) + 1e-5)
+        # src /= stdev
+
+        _, _, N = src.shape
+        
+        # transformer takes in (seq_len, batch, input_size) normally, but for itransformer, we swap seq_len and input_size
+        src = rearrange(src, 'batch seq_len input_size -> input_size batch seq_len')
+
+        # Embedding
         src = self.encoder(src) * math.sqrt(self.input_size)
-        src = self.positional_encoding(src)
+        # src = self.positional_encoding(src)
 
-        tgt = self.encoder(tgt) * math.sqrt(self.input_size)
-        tgt = self.positional_encoding(tgt)
+        x = self.decoder(src)
+        x = rearrange(x, 'input_size batch seq_len -> batch seq_len input_size')
+        x = self.projection(x)
+        # De-Normalization from Non-stationary Transformer
+        # x = x * (stdev[:, 0, :].unsqueeze(1).repeat(1, self.target_length, 1))
+        # x = x + (means[:, 0, :].unsqueeze(1).repeat(1, self.target_length, 1))
 
-        x = self.transformer(src=src, tgt=tgt)
-        out = self.decoder(x)
-
-        # Here we change the data format
-        # from (1, batch_size, output_chunk_length * output_size)
-        # to (batch_size, output_chunk_length, output_size, nr_params)
-        predictions = out[0, :, :]
-        predictions = predictions.view(
-            -1, self.target_length, self.target_size, self.nr_params
+        predictions = x.view(
+            x.shape[0], self.target_length, self.target_size,  self.nr_params
         )
 
         return predictions
+        # return x
+        
+        # Here we create 'src' and 'tgt', the inputs for the encoder and decoder
+        # side of the Transformer architecture
+        # src, tgt = self._create_transformer_inputs(data)
+
+        # # "math.sqrt(self.input_size)" is a normalization factor
+        # # see section 3.2.1 in 'Attention is All you Need' by Vaswani et al. (2017)
+        # src = self.encoder(src) * math.sqrt(self.input_size)
+        # src = self.positional_encoding(src)
+
+        # tgt = self.encoder(tgt) * math.sqrt(self.input_size)
+        # tgt = self.positional_encoding(tgt)
+
+        # x = self.transformer(src=src, tgt=tgt)
+        # out = self.decoder(x)
+
+        # # Here we change the data format
+        # # from (1, batch_size, output_chunk_length * output_size)
+        # # to (batch_size, output_chunk_length, output_size, nr_params)
+        # predictions = out[0, :, :]
+        # predictions = predictions.view(
+        #     -1, self.target_length, self.target_size, self.nr_params
+        # )
+
+        # return predictions
 
 
-class Autoformer(PastCovariatesTorchModel):
+class ITransformerModel(PastCovariatesTorchModel):
     def __init__(
         self,
         input_chunk_length: int,
@@ -387,13 +330,11 @@ class Autoformer(PastCovariatesTorchModel):
         d_model: int = 64,
         nhead: int = 4,
         num_encoder_layers: int = 3,
-        num_decoder_layers: int = 3,
         dim_feedforward: int = 512,
         dropout: float = 0.1,
         activation: str = "relu",
         norm_type: Union[str, nn.Module, None] = None,
         custom_encoder: Optional[nn.Module] = None,
-        custom_decoder: Optional[nn.Module] = None,
         **kwargs,
     ):
 
@@ -499,7 +440,7 @@ class Autoformer(PastCovariatesTorchModel):
             If set to ``True``, any previously-existing model with the same name will be reset (all checkpoints will
             be discarded). Default: ``False``.
         save_checkpoints
-            Whether or not to automatically save the untrained model and checkpoints from training.
+            Whether to automatically save the untrained model and checkpoints from training.
             To load the model from checkpoint, call :func:`MyModelClass.load_from_checkpoint()`, where
             :class:`MyModelClass` is the :class:`TorchForecastingModel` class that was used (such as :class:`TFTModel`,
             :class:`NBEATSModel`, etc.). If set to ``False``, the model can still be manually saved using
@@ -637,24 +578,14 @@ class Autoformer(PastCovariatesTorchModel):
         # extract pytorch lightning module kwargs
         self.pl_module_params = self._extract_pl_module_params(**self.model_params)
 
-        # self.seq_len = configs.seq_len
-        self.label_len = configs.label_len
-        # self.pred_len = configs.pred_len
-        self.output_attention = configs.output_attention
-
-        # Decomp
-        self.kernel_size = configs.moving_avg
-        
-        # self.d_model = d_model
-        # self.nhead = nhead
-        # self.num_encoder_layers = num_encoder_layers
-        # self.num_decoder_layers = num_decoder_layers
-        # self.dim_feedforward = dim_feedforward
-        # self.dropout = dropout
-        # self.activation = activation
-        # self.norm_type = norm_type
-        # self.custom_encoder = custom_encoder
-        # self.custom_decoder = custom_decoder
+        self.d_model = d_model
+        self.nhead = nhead
+        self.num_encoder_layers = num_encoder_layers
+        self.dim_feedforward = dim_feedforward
+        self.dropout = dropout
+        self.activation = activation
+        self.norm_type = norm_type
+        self.custom_encoder = custom_encoder
 
     @property
     def supports_multivariate(self) -> bool:
@@ -668,19 +599,17 @@ class Autoformer(PastCovariatesTorchModel):
         output_dim = train_sample[-1].shape[1]
         nr_params = 1 if self.likelihood is None else self.likelihood.num_parameters
 
-        return _Autoformer(
+        return _ITransformerModule(
             input_size=input_dim,
             output_size=output_dim,
             nr_params=nr_params,
             d_model=self.d_model,
             nhead=self.nhead,
             num_encoder_layers=self.num_encoder_layers,
-            num_decoder_layers=self.num_decoder_layers,
             dim_feedforward=self.dim_feedforward,
             dropout=self.dropout,
             activation=self.activation,
             norm_type=self.norm_type,
             custom_encoder=self.custom_encoder,
-            custom_decoder=self.custom_decoder,
             **self.pl_module_params,
         )

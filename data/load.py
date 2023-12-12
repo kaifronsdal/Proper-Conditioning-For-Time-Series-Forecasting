@@ -4,6 +4,8 @@ from typing import Optional
 from pathlib import Path
 import pickle
 
+import numpy as np
+
 from darts.dataprocessing.transformers import Scaler, MissingValuesFiller
 from darts.dataprocessing import Pipeline
 
@@ -19,6 +21,8 @@ from darts.datasets import (
     ETTm1Dataset,
     ETTm2Dataset
 )
+from sklearn.preprocessing import StandardScaler
+
 
 @dataclass
 class Dataset:
@@ -29,7 +33,8 @@ class Dataset:
     encoders: dict = field(default_factory=dict)
 
 def get_scaler():
-    return Scaler()
+    return Scaler(scaler=StandardScaler())
+    # return Scaler()
 
 def get_missing_filler():
     return MissingValuesFiller()
@@ -40,22 +45,22 @@ def get_scaler_missing():
 dataset_map = {
     'electricity': Dataset(
         source=ElectricityDataset,
-        split=[0.6,0.8],
+        split=[0.6, 0.8],
         loader_params={'multivariate': True},
         encoders= {
             'cyclic': {'past': ['month', 'dayofyear', 'dayofweek', 'hour']},
             'datetime_attribute': {'past': ['year', 'month']},
-            # 'transformer': get_scaler(),
+            'transformer': get_scaler(),
         }
     ),
     'exchange': Dataset(
         source=ExchangeRateDataset,
-        split=[0.6,0.8],
+        split=[0.25, 0.92, 0.96],
         loader_params={'multivariate': True},
         encoders= {
-            'cyclic': {'past': ['month', 'dayofyear', 'dayofweek', 'hour']},
-            'datetime_attribute': {'past': ['year', 'month']},
-            # 'transformer': get_scaler(),
+            'position': {'past': ['relative']},
+            'custom': {'past': [np.cos, np.sin]},
+            'transformer': get_scaler(),
         }
     ),
     'ili': Dataset(
@@ -65,7 +70,7 @@ dataset_map = {
         encoders= {
             'cyclic': {'past': ['month', 'dayofyear', 'dayofweek', 'hour']},
             'datetime_attribute': {'past': ['year', 'month']},
-            # 'transformer': get_scaler(),
+            'transformer': get_scaler_missing(),
         }
     ),
     'traffic': Dataset(
@@ -75,7 +80,7 @@ dataset_map = {
         encoders= {
             'cyclic': {'past': ['month', 'dayofyear', 'dayofweek', 'hour']},
             'datetime_attribute': {'past': ['year', 'month']},
-            # 'transformer': get_scaler(),
+            'transformer': get_scaler(),
         }
     ),
     'uber': Dataset(
@@ -85,17 +90,17 @@ dataset_map = {
         encoders= {
             'cyclic': {'past': ['month', 'dayofyear', 'dayofweek', 'hour']},
             'datetime_attribute': {'past': ['year', 'month']},
-            # 'transformer': get_scaler(),
+            'transformer': get_scaler(),
         }
     ),
     'weather': Dataset(
         source=WeatherDataset,
-        split=[0.6,0.8],
+        split=[0.8, 0.99, 0.995],
         loader_params={'multivariate': True},
         encoders= {
             'cyclic': {'past': ['month', 'dayofyear', 'dayofweek', 'hour']},
             'datetime_attribute': {'past': ['year', 'month']},
-            # 'transformer': get_scaler(),
+            'transformer': get_scaler(),
         }
     ),
     'ettm1': Dataset(
@@ -104,7 +109,7 @@ dataset_map = {
         encoders= {
             'cyclic': {'past': ['month', 'dayofyear', 'dayofweek', 'hour']},
             'datetime_attribute': {'past': ['year', 'month']},
-            # 'transformer': get_scaler(),
+            'transformer': get_scaler(),
         }
     ),
     'ettm2': Dataset(
@@ -113,7 +118,7 @@ dataset_map = {
         encoders= {
             'cyclic': {'past': ['month', 'dayofyear', 'dayofweek', 'hour']},
             'datetime_attribute': {'past': ['year', 'month']},
-            # 'transformer': get_scaler(),
+            'transformer': get_scaler(),
         }
     ),
     'airpassenger': Dataset(
@@ -122,7 +127,7 @@ dataset_map = {
         encoders= {
             'cyclic': {'past': ['month']},
             'datetime_attribute': {'past': ['year']},
-            # 'transformer': get_scaler(),
+            'transformer': get_scaler(),
         }
     ),
     # 'energy': Dataset(
@@ -131,7 +136,7 @@ dataset_map = {
     #     encoders= {
     #         'cyclic': {'past': ['month', 'dayofyear', 'dayofweek', 'hour']},
     #         'datetime_attribute': {'past': ['year', 'month']},
-    #         # 'transformer': get_scaler(),
+    #         'transformer': get_scaler(),
     #     }
     # ),
 }
